@@ -30,6 +30,9 @@
  * Word wrap (config.ini, off by default): reflows long lines in the
  * message box only, without breaking words apart.
  *
+ * Shortcuts:
+ * Press Ctrl+R in-game to reload translation files and re-apply text translations.
+ *
  * Processing order: translation, then scaling, then word wrap. Either
  * feature is skipped entirely at startup when left off — no hooks are
  * installed and there is no runtime cost.
@@ -110,64 +113,68 @@
   const WORD_WRAP_ENABLED = config.word_wrap === '1';
   const USE_COMMON_TERMS = config.use_common_terms === '1';
 
-let dict = {};
-  if (fs.existsSync(TEXT_FILE)) {
-    try {
-      const rawData = fs.readFileSync(TEXT_FILE, 'utf8');
-      const parsed = JSON.parse(rawData);
+  let dict = {};
+  let _sortedDictKeys = null;
 
-      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-        throw new Error('JSON root must be a key-value object mapping {"original": "translated"}.');
-      }
+  function loadDictionary() {
+    let newDict = {};
+    if (fs.existsSync(TEXT_FILE)) {
+      try {
+        const rawData = fs.readFileSync(TEXT_FILE, 'utf8');
+        const parsed = JSON.parse(rawData);
 
-      dict = parsed;
-
-      // Optionally merge common terms in memory. Common terms are loaded
-      // after the selected translation file so identical keys are overridden
-      // by commonTerms.json. Neither source file is modified or rewritten.
-      if (USE_COMMON_TERMS) {
-        const commonTermsPath = path.join(TRANS_DIR, 'commonTerms.json');
-        if (fs.existsSync(commonTermsPath)) {
-          try {
-            const commonTermsRaw = fs.readFileSync(commonTermsPath, 'utf8');
-            const commonTerms = JSON.parse(commonTermsRaw);
-
-            if (typeof commonTerms !== 'object' || commonTerms === null || Array.isArray(commonTerms)) {
-              throw new Error('JSON root must be a key-value object mapping {"original": "translated"}.');
-            }
-
-            dict = Object.assign({}, dict, commonTerms);
-          } catch (commonError) {
-            console.error('[Translation] commonTerms.json load error:', commonError);
-          }
-        } else {
-          console.warn('[Translation] commonTerms.json not found; continuing without common terms.');
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          throw new Error('JSON root must be a key-value object mapping {"original": "translated"}.');
         }
-      }
-    } catch (e) {
-      console.error('[Translation] JSON load error:', e);
 
-      const warningMessage = 
-        `[Translation Plugin Error]\n` +
-        `Failed to parse file: ${config.file}\n\n` +
-        `Details: ${e.message}\n\n` +
-        `Please check your JSON formatting (missing commas, quotes, or trailing commas).`;
+        newDict = parsed;
 
-      if (typeof window !== 'undefined' && window.alert) {
-        window.alert(warningMessage);
-      } else if (typeof alert !== 'undefined') {
-        alert(warningMessage);
+        if (USE_COMMON_TERMS) {
+          const commonTermsPath = path.join(TRANS_DIR, 'commonTerms.json');
+          if (fs.existsSync(commonTermsPath)) {
+            try {
+              const commonTermsRaw = fs.readFileSync(commonTermsPath, 'utf8');
+              const commonTerms = JSON.parse(commonTermsRaw);
+
+              if (typeof commonTerms !== 'object' || commonTerms === null || Array.isArray(commonTerms)) {
+                throw new Error('JSON root must be a key-value object mapping {"original": "translated"}.');
+              }
+
+              newDict = Object.assign({}, newDict, commonTerms);
+            } catch (commonError) {
+              console.error('[Translation] commonTerms.json load error:', commonError);
+            }
+          } else {
+            console.warn('[Translation] commonTerms.json not found; continuing without common terms.');
+          }
+        }
+
+        dict = newDict;
+        _sortedDictKeys = null; // Reset cached sorted keys for partial matching
+        return true;
+      } catch (e) {
+        console.error('[Translation] JSON load error:', e);
+
+        const warningMessage = 
+          `[Translation Plugin Error]\n` +
+          `Failed to parse file: ${config.file}\n\n` +
+          `Details: ${e.message}\n\n` +
+          `Please check your JSON formatting (missing commas, quotes, or trailing commas).`;
+
+        if (typeof window !== 'undefined' && window.alert) {
+          window.alert(warningMessage);
+        } else if (typeof alert !== 'undefined') {
+          alert(warningMessage);
+        }
+        return false;
       }
     }
+    return false;
   }
+
+  loadDictionary();
 
   const hasImages = fs.existsSync(IMAGES_DIR);
-
-  function translate(str) {
-    if (typeof str !== 'string' || str.length === 0) return str;
-    const hit = dict[str];
-    return hit !== undefined ? hit : str;
-  }
 
   // Recursively replace any string value in a loaded data object that
   // exactly matches a dictionary key. Covers database entries (names,
@@ -189,9 +196,7 @@ let dict = {};
     }
   }
 
-// --- Enhanced Translation Helper (with line break normalization & partial match) ---
-  let _sortedDictKeys = null;
-
+  // --- Enhanced Translation Helper (with line break normalization & partial match) ---
   function translate(str) {
     if (typeof str !== 'string' || str.length === 0) return str;
     if (dict[str] !== undefined) return dict[str];
@@ -229,6 +234,48 @@ let dict = {};
     }
   };
 
+  // --- Reload Translation Functionality ---
+  function reloadTranslation() {
+    if (loadDictionary()) {
+      // Re-walk database and current map data
+      if (typeof $dataSystem !== 'undefined' &&$dataSystem) {
+        const globalObjects = [
+          $dataActors,$dataClasses, $dataSkills,$dataItems,
+          $dataWeapons,$dataArmors, $dataEnemies,$dataTroops,
+          $dataStates,$dataAnimations, $dataTilesets,$dataCommonEvents,
+          $dataSystem,$dataMap
+        ];
+        const seen = new WeakSet();
+        for (const obj of globalObjects) {
+          if (obj) walk(obj, seen);
+        }
+      }
+
+      // Refresh current scene windows/renderers if active
+      if (typeof SceneManager !== 'undefined' && SceneManager._scene) {
+        const scene = SceneManager._scene;
+        if (typeof scene.requestUpdate === 'function') scene.requestUpdate();
+        if (scene.children) {
+          scene.children.forEach(child => {
+            if (child && typeof child.refresh === 'function') {
+              child.refresh();
+            }
+          });
+        }
+      }
+
+      console.log('[Translation] Reloaded successfully!');
+    }
+  }
+
+  // Keybind listener: Ctrl + R
+  document.addEventListener('keydown', (event) => {
+    if (event.ctrlKey && (event.key === 'r' || event.key === 'R')) {
+      event.preventDefault();
+      reloadTranslation();
+    }
+  });
+
   // --- 2. Dynamic Event Text & Choices Hook ---
   if (typeof Game_Message !== 'undefined') {
     const _Game_Message_add = Game_Message.prototype.add;
@@ -262,7 +309,7 @@ let dict = {};
       let translatedText = translate(text);
 
       // 2. Temporarily intercept game variables to translate non-numeric variable values
-      if (typeof $gameVariables !== 'undefined' && $gameVariables !== null) {
+      if (typeof $gameVariables !== 'undefined' &&$gameVariables !== null) {
         const _original_gameVariables_value = $gameVariables.value;
         
         $gameVariables.value = function(variableId) {
@@ -288,8 +335,6 @@ let dict = {};
     // Formatted Text / Escape Sequences (Message Box, Descriptions)
     const _Window_Base_drawTextEx = Window_Base.prototype.drawTextEx;
     Window_Base.prototype.drawTextEx = function(text, x, y, width) {
-      // Translation is now handled in convertEscapeCharacters, but we keep this
-      // as a fallback for any custom plugins bypassing standard text processing.
       const translated = translate(text);
       if (isMZ) {
         return _Window_Base_drawTextEx.call(this, translated, x, y, width);
@@ -306,14 +351,6 @@ let dict = {};
   };
 
   // --- 5. PIXI Text Catch-All Hook ---
-  //
-  // Some custom windows/panels do not use Window_Base.drawText() or
-  // Bitmap.drawText(). Plugins may create PIXI.Text / PIXI.BitmapText
-  // objects directly and set their .text property. Hook the property
-  // setter so those renderers are translated as well.
-  //
-  // This is renderer-level rather than class-level, so it also covers
-  // custom Window classes that override drawText() completely.
   function hookPixiTextProperty(ctorName) {
     try {
       if (typeof PIXI === 'undefined' || !PIXI[ctorName]) return;
@@ -356,55 +393,51 @@ let dict = {};
     hookPixiTextProperty('BitmapText');
   }
 
-// --- Image redirection ---
-if (hasImages) {
-  // Safe encryption bypass for unencrypted translation images
-  const _Bitmap_startLoading = Bitmap.prototype._startLoading;
-  Bitmap.prototype._startLoading = function() {
-    if (this._url && this._url.includes('_translation')) {
-      this._image = new Image();
-      this._image.onload = this._onLoad.bind(this);
-      this._image.onerror = this._onError.bind(this);
-      if (typeof this._destroyCanvas === 'function') {
-        this._destroyCanvas(); // MZ specific cleanup
+  // --- Image redirection ---
+  if (hasImages) {
+    const _Bitmap_startLoading = Bitmap.prototype._startLoading;
+    Bitmap.prototype._startLoading = function() {
+      if (this._url && this._url.includes('_translation')) {
+        this._image = new Image();
+        this._image.onload = this._onLoad.bind(this);
+        this._image.onerror = this._onError.bind(this);
+        if (typeof this._destroyCanvas === 'function') {
+          this._destroyCanvas(); // MZ specific cleanup
+        }
+        this._loadingState = 'loading';
+        this._image.src = this._url;
+        return;
       }
-      this._loadingState = 'loading';
-      this._image.src = this._url;
-      return;
-    }
-    _Bitmap_startLoading.call(this);
-  };
+      _Bitmap_startLoading.call(this);
+    };
 
-  // Hook image loaders
-  if (typeof ImageManager.loadNormalBitmap === 'function') {
-    // RPG Maker MV
-    const _ImageManager_loadNormalBitmap = ImageManager.loadNormalBitmap;
-    ImageManager.loadNormalBitmap = function(pathArg, hue) {
-      const redirected = resolveTranslatedImage(pathArg);
-      if (redirected === pathArg) {
-        return _ImageManager_loadNormalBitmap.call(this, pathArg, hue);
-      }
-      return ImageManager.loadBitmapFromUrl ? ImageManager.loadBitmapFromUrl(redirected) : Bitmap.load(redirected);
-    };
-  } else if (typeof ImageManager.loadBitmap === 'function') {
-    // RPG Maker MZ
-    const _ImageManager_loadBitmap = ImageManager.loadBitmap;
-    ImageManager.loadBitmap = function(folder, filename) {
-      if (!filename) {
+    if (typeof ImageManager.loadNormalBitmap === 'function') {
+      const _ImageManager_loadNormalBitmap = ImageManager.loadNormalBitmap;
+      ImageManager.loadNormalBitmap = function(pathArg, hue) {
+        const redirected = resolveTranslatedImage(pathArg);
+        if (redirected === pathArg) {
+          return _ImageManager_loadNormalBitmap.call(this, pathArg, hue);
+        }
+        return ImageManager.loadBitmapFromUrl ? ImageManager.loadBitmapFromUrl(redirected) : Bitmap.load(redirected);
+      };
+    } else if (typeof ImageManager.loadBitmap === 'function') {
+      const _ImageManager_loadBitmap = ImageManager.loadBitmap;
+      ImageManager.loadBitmap = function(folder, filename) {
+        if (!filename) {
+          return _ImageManager_loadBitmap.call(this, folder, filename);
+        }
+        
+        const unencryptedPath = folder + Utils.encodeURI(filename) + ".png";
+        const redirected = resolveTranslatedImage(unencryptedPath);
+        
+        if (redirected !== unencryptedPath) {
+          return this.loadBitmapFromUrl(redirected);
+        }
+        
         return _ImageManager_loadBitmap.call(this, folder, filename);
-      }
-      
-      const unencryptedPath = folder + Utils.encodeURI(filename) + ".png";
-      const redirected = resolveTranslatedImage(unencryptedPath);
-      
-      if (redirected !== unencryptedPath) {
-        return this.loadBitmapFromUrl(redirected);
-      }
-      
-      return _ImageManager_loadBitmap.call(this, folder, filename);
-    };
+      };
+    }
   }
-}
 
   function resolveTranslatedImage(gamePath) {
     try {
@@ -414,7 +447,6 @@ if (hasImages) {
       decoded = decoded.split('?')[0].split('#')[0];
       decoded = decoded.replace(/^\/+/, '');
 
-      // Remove RPG Maker's img/ prefix.
       let relative = decoded.replace(/^img\//i, '');
 
       const candidate = path.join(IMAGES_DIR, relative);
@@ -438,16 +470,10 @@ if (hasImages) {
     return gamePath;
   }
 
-  // ---------------------------------------------------------------------
-  // Text scaling (2nd pass). Adjusts contents.fontSize only — never touches
-  // fontFace — so the game's configured font is never overridden. When
-  // disabled (scaling_percent=100 or scaling_mode=0), none of this block's
-  // hooks are installed at all: Window_Base.prototype is left completely
-  // untouched and there is zero runtime overhead.
-  // ---------------------------------------------------------------------
+  // --- Text scaling ---
   if (SCALING_ENABLED) {
     const isEligibleWindow = function(win) {
-      if (SCALING_MODE === 2) return true; // global
+      if (SCALING_MODE === 2) return true;
       if (typeof Window_Message !== 'undefined' && win instanceof Window_Message) return true;
       if (typeof Window_NameBox !== 'undefined' && win instanceof Window_NameBox) return true;
       if (typeof Window_ChoiceList !== 'undefined' && win instanceof Window_ChoiceList) return true;
@@ -489,20 +515,8 @@ if (hasImages) {
     };
   }
 
-  // ---------------------------------------------------------------------
-  // Word wrap (3rd pass). Message box only. Reflows on whitespace so words
-  // are never broken apart; explicit "\n" line breaks in the source text
-  // are preserved as paragraph boundaries. Measurement happens after the
-  // scaling block above has already run (font is reset per page before
-  // this fires), so wrap width naturally accounts for any active scaling.
-  // When disabled, none of this block's hooks are installed at all.
-  // ---------------------------------------------------------------------
+  // --- Word wrap ---
   if (WORD_WRAP_ENABLED) {
-    // Estimates rendered width of a token, skipping over (but not
-    // stripping from the output) recognized escape-code sequences so they
-    // don't get measured as literal backslash characters. \I[n] icons get
-    // a fixed width; other bracketed/control codes are treated as zero
-    // width, matching how they render (no visible glyph of their own).
     const measureVisibleWidth = function(win, str) {
       let width = 0;
       let i = 0;
@@ -565,13 +579,6 @@ if (hasImages) {
       }).join('\n');
     };
 
-    // Do the wrapping on the first update after startMessage() has run.
-    // RPG Maker initializes _textState and calls newPage()/resetFontSettings()
-    // inside startMessage(). Running the wrapper from startMessage() itself is
-    // therefore fragile: the text state has already entered the message
-    // lifecycle, while some engine versions can subsequently rebuild/reset
-    // portions of it. updateMessage() is the first common point where the
-    // scaled font is active and the text has not yet been consumed.
     const _Window_Message_updateMessage = Window_Message.prototype.updateMessage;
     Window_Message.prototype.updateMessage = function() {
       if (this._textState &&
@@ -583,8 +590,6 @@ if (hasImages) {
 
       const result = _Window_Message_updateMessage.call(this);
 
-      // Clear the per-message flag once the message has finished so the next
-      // message can be wrapped independently.
       if (!this._textState) {
         this._translationWordWrapApplied = false;
       }
