@@ -2,16 +2,20 @@
 """
 Extracts translatable text from an RPG Maker MV/MZ game's "data" folder
 (and, optionally, js/plugins) and saves it into this extractor folder as
-a JSON file named after _translation/config.ini's "file" key (e.g.
-translation.json) — never into the file the game actually loads.
+a JSON file named textForTranslation.json — never into the file the game
+actually loads.
 
 If that file already exists here, you're asked whether to overwrite it;
 nothing is merged or appended automatically.
+
+A separate text-processing menu prunes the extracted file in place. All
+pruning works on whole JSON entries (keys), so the file stays valid JSON.
 """
 import json
 import os
 import re
 import sys
+import unicodedata
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TRANS_DIR = os.path.dirname(SCRIPT_DIR)   # _translation
@@ -99,6 +103,10 @@ def is_likely_translatable(s):
 
     # Standalone kebab-case CSS classes/identifiers without spaces
     if re.match(r'^[a-z0-9]+(-[a-z0-9]+)+$', t) and ' ' not in t:
+        return False
+
+    # Plugin command with a JSON argument object, e.g. `Name = {"id":"18",...}`
+    if re.match(r'^\S+(\s*=\s*|\s+)\{\s*"[^"]*"\s*:.*\}\s*$', t, re.DOTALL):
         return False
 
     return True
@@ -234,31 +242,55 @@ def scan_data_folder(collected, data_dir):
 # js/plugins/*.js extraction (optional, heuristic, best-effort)
 # --------------------------------------------------------------------
 
-def prune_against_common_terms(json_path, common_terms_path):
-    """Remove entries whose original-text key exists in commonTerms.json."""
-    with open(common_terms_path, 'r', encoding='utf-8') as f:
-        common_terms = json.load(f)
+OUTPUT_NAME = 'textForTranslation.json'
 
-    if not isinstance(common_terms, dict):
-        raise ValueError('commonTerms.json must contain a JSON object.')
+# Japanese: CJK ideographs, hiragana, katakana, half-width katakana.
+# Equivalent to the requested ^[^\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF\uFF65-\uFF9F]*\n
+# applied to a whole entry: an entry with no Japanese character is removed.
+JP_RE = re.compile(r'[\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF\uFF65-\uFF9F]')
 
-    with open(json_path, 'r', encoding='utf-8') as f:
-        extracted = json.load(f)
 
-    if not isinstance(extracted, dict):
-        raise ValueError('The extracted JSON must contain a JSON object.')
+def load_dict(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f'{os.path.basename(path)} must contain a JSON object.')
+    return data
 
-    original_count = len(extracted)
-    for key in common_terms:
-        extracted.pop(key, None)
 
-    removed_count = original_count - len(extracted)
-
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(extracted, f, ensure_ascii=False, indent=4)
+def save_dict(path, data):
+    # Write to a temp file first so a failure can't leave a broken JSON file.
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
         f.write('\n')
+    os.replace(tmp, path)
 
-    return removed_count, len(extracted)
+
+def prune_entries(json_path, should_remove):
+    """Remove entries whose key satisfies should_remove(key). Returns (removed, remaining)."""
+    data = load_dict(json_path)
+    kept = {k: v for k, v in data.items() if not should_remove(k)}
+    removed = len(data) - len(kept)
+    save_dict(json_path, kept)
+    return removed, len(kept)
+
+
+def is_symbols_only(s):
+    """True if every character is a symbol, punctuation, whitespace, control,
+    or emoji-support character (ZWJ, variation selectors). Covers Unicode and
+    the Unicode equivalents of S-JIS symbols (○●★※→ etc.). Letters, digits and
+    kana/kanji (incl. the long-vowel mark ー) count as text."""
+    for ch in s:
+        cat = unicodedata.category(ch)
+        if cat[0] in 'PSZC' or cat in ('Mn', 'Me'):
+            continue
+        return False
+    return True
+
+
+def load_key_set(path):
+    return set(load_dict(path).keys())
 
 
 def scan_plugins_folder(collected, plugins_dir):
@@ -293,14 +325,47 @@ def main():
 
     data_dir = os.path.join(base, 'data')
     plugins_dir = os.path.join(base, 'js', 'plugins')
+    out_path = os.path.join(SCRIPT_DIR, OUTPUT_NAME)
 
     print(f'Game data found at: {data_dir}')
+
+    while True:
+        print('')
+        print('Main menu:')
+        print('  1) Extract text')
+        print('  2) Process extracted text')
+        print('  0) Quit')
+        choice = input('Select an option (1/2/0): ').strip()
+        if choice == '0':
+            return
+        elif choice == '1':
+            extract_menu(data_dir, plugins_dir, out_path)
+        elif choice == '2':
+            process_menu(out_path)
+        else:
+            print('Invalid choice.')
+
+
+def extract_menu(data_dir, plugins_dir, out_path):
     print('')
     print('What should be scanned?')
     print('  1) data folder only')
     print('  2) data folder + js/plugins(best guess)')
     choice = input('Select an option (1/2): ').strip()
+    if choice not in ('1', '2'):
+        print('Invalid choice.')
+        return
     scan_plugins = (choice == '2')
+
+    if os.path.isfile(out_path):
+        print('')
+        print(f'{OUTPUT_NAME} already exists in the extractor folder.')
+        print('  1) Overwrite it')
+        print('  2) Cancel')
+        choice2 = input('Select an option (1/2): ').strip()
+        if choice2 != '1':
+            print('Cancelled. Nothing was written.')
+            return
 
     collected = {}
 
@@ -314,53 +379,65 @@ def main():
         else:
             print('js/plugins folder not found, skipping.')
 
-    config = load_config()
-    out_path = os.path.join(SCRIPT_DIR, config['file'])
-
-    if os.path.isfile(out_path):
-        print('')
-        print(f'{config["file"]} already exists in the extractor folder.')
-        print('  1) Overwrite it')
-        print('  2) Cancel')
-        choice2 = input('Select an option (1/2): ').strip()
-        if choice2 != '1':
-            print('Cancelled. Nothing was written.')
-            input('Press Enter to exit')
-            return
-
-    with open(out_path, 'w', encoding='utf-8') as f:
-        json.dump(collected, f, ensure_ascii=False, indent=4)
-        f.write('\n')
+    save_dict(out_path, collected)
 
     print('')
     print(f'Found {len(collected)} unique strings.')
     print(f'Saved to: {out_path}')
 
-    common_terms_path = os.path.join(TRANS_DIR, 'commonTerms.json')
-    if os.path.isfile(common_terms_path):
-        print('')
-        prune_choice = input('Prune the extracted file against commonTerms.json? (y/n): ').strip().lower()
-        if prune_choice in ('y', 'yes'):
-            try:
-                removed_count, remaining_count = prune_against_common_terms(
-                    out_path, common_terms_path
-                )
-                print(f'Pruned {removed_count} strings already present in commonTerms.json.')
-                print(f'{remaining_count} strings remain.')
-            except Exception as e:
-                print(f'Could not prune the file: {e}')
-        elif prune_choice not in ('n', 'no', ''):
-            print('Invalid choice; pruning skipped.')
-    else:
-        print('')
-        print(f'commonTerms.json not found at: {common_terms_path}')
-        print('Pruning skipped.')
-
     if scan_plugins:
         print('Note: js/plugins text is found heuristically and may include some')
         print('false positives (code, not player-facing text) - please review.')
 
-    input('Press Enter to exit')
+
+def process_menu(out_path):
+    if not os.path.isfile(out_path):
+        print('')
+        print(f'{OUTPUT_NAME} not found. Extract text first (main menu option 1).')
+        return
+
+    common_terms_path = os.path.join(TRANS_DIR, 'commonTerms.json')
+    config = load_config()
+    translation_path = os.path.join(TRANS_DIR, config['file'])
+
+    while True:
+        print('')
+        print('Text processing:')
+        print('  1) Prune against commonTerms.json')
+        print(f'  2) Prune against commonTerms.json + {config["file"]}')
+        print('  3) Prune non-Japanese text')
+        print('  4) Prune symbol-only text')
+        print('  0) Back')
+        choice = input('Select an option (1/2/3/4/0): ').strip()
+
+        try:
+            if choice == '0':
+                return
+            elif choice in ('1', '2'):
+                known = set()
+                sources = [common_terms_path]
+                if choice == '2':
+                    sources.append(translation_path)
+                for p in sources:
+                    if os.path.isfile(p):
+                        known |= load_key_set(p)
+                    else:
+                        print(f'Not found, skipped: {p}')
+                if not known:
+                    print('Nothing to prune against.')
+                    continue
+                removed, remaining = prune_entries(out_path, lambda k: k in known)
+                print(f'Pruned {removed} already-known strings. {remaining} remain.')
+            elif choice == '3':
+                removed, remaining = prune_entries(out_path, lambda k: not JP_RE.search(k))
+                print(f'Pruned {removed} non-Japanese strings. {remaining} remain.')
+            elif choice == '4':
+                removed, remaining = prune_entries(out_path, is_symbols_only)
+                print(f'Pruned {removed} symbol-only strings. {remaining} remain.')
+            else:
+                print('Invalid choice.')
+        except Exception as e:
+            print(f'Could not process the file: {e}')
 
 
 if __name__ == '__main__':
