@@ -181,17 +181,62 @@
   // descriptions, messages) and map/event data (Show Text, choices,
   // names, scrolling text, comments, etc.) since both load through
   // DataManager.
-  function walk(obj, seen) {
+  //
+  // _originals remembers the untranslated string for every value replaced,
+  // so a reload re-translates from the original. Without it the data holds
+  // already-translated text, which matches no dictionary key.
+  const _originals = new WeakMap();
+  // translated string -> original, used to undo translation of file names
+  // that slip through (plugin commands, scripts, etc.) at asset-load time.
+  const _reverse = new Map();
+
+  // Strings ending in an asset extension (plain or MV/MZ-encrypted) are file names.
+  const FILE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|ogg|m4a|wav|mp3|mp4|webm|rpgmvp|rpgmvm|rpgmvo|png_|ogg_|m4a_)$/i;
+
+  // Fields holding file names (images/audio/animations). Never translated,
+  // otherwise the game looks for a file that doesn't exist.
+  const FILE_KEYS = new Set([
+    'characterName', 'faceName', 'battlerName',
+    'battleback1Name', 'battleback2Name', 'parallaxName',
+    'title1Name', 'title2Name', 'tilesetNames',
+    'animation1Name', 'animation2Name', 'effectName'
+  ]);
+  // Event commands whose parameters are file names: code -> parameter indices.
+  // (Show Picture, Change Battle Back, Change Parallax, Change Actor Images, Play Movie)
+  const CMD_FILE_PARAMS = {
+    231: [1], 283: [0, 1], 284: [0], 322: [1, 3, 5], 261: [0]
+  };
+
+  function walk(obj, seen, skip) {
     if (obj === null || typeof obj !== 'object') return;
     if (seen.has(obj)) return;
     seen.add(obj);
+    let recs = _originals.get(obj);
+    // Audio objects {name, volume, pitch, ...}: name is a file name.
+    const isAudio = typeof obj.name === 'string' && 'volume' in obj && 'pitch' in obj;
+    let paramSkip = null;
+    if (typeof obj.code === 'number' && Array.isArray(obj.parameters) && CMD_FILE_PARAMS[obj.code]) {
+      paramSkip = new Set(CMD_FILE_PARAMS[obj.code].map(String));
+    }
     for (const key of Object.keys(obj)) {
+      if (FILE_KEYS.has(key)) continue;
+      if (isAudio && key === 'name') continue;
+      if (skip && skip.has(key)) continue;
       const val = obj[key];
       if (typeof val === 'string') {
-        const t = translate(val);
+        const rec = recs && recs.get(key);
+        const source = (rec && rec.trans === val) ? rec.orig : val;
+        const t = translate(source);
         if (t !== val) obj[key] = t;
+        if (t !== source) {
+          if (!recs) { recs = new Map(); _originals.set(obj, recs); }
+          recs.set(key, { orig: source, trans: t });
+          _reverse.set(t, source);
+        } else if (rec) {
+          recs.delete(key);
+        }
       } else if (val !== null && typeof val === 'object') {
-        walk(val, seen);
+        walk(val, seen, key === 'parameters' ? paramSkip : null);
       }
     }
   }
@@ -199,6 +244,7 @@
   // --- Enhanced Translation Helper (with line break normalization & partial match) ---
   function translate(str) {
     if (typeof str !== 'string' || str.length === 0) return str;
+    if (FILE_EXT_RE.test(str)) return str;
     if (dict[str] !== undefined) return dict[str];
     
     const normalized = str.replace(/\r\n/g, '\n');
@@ -234,6 +280,28 @@
     }
   };
 
+  // --- On-screen notification (upper left, 1 second) ---
+  let _notifyEl = null;
+  let _notifyTimer = null;
+  function notify(message) {
+    try {
+      if (!_notifyEl) {
+        _notifyEl = document.createElement('div');
+        _notifyEl.style.cssText =
+          'position:fixed;top:8px;left:8px;z-index:100000;padding:4px 10px;' +
+          'background:rgba(0,0,0,0.7);color:#fff;font:14px sans-serif;' +
+          'border-radius:4px;pointer-events:none;';
+        document.body.appendChild(_notifyEl);
+      }
+      _notifyEl.textContent = message;
+      _notifyEl.style.display = 'block';
+      clearTimeout(_notifyTimer);
+      _notifyTimer = setTimeout(() => { _notifyEl.style.display = 'none'; }, 1000);
+    } catch (e) {
+      console.warn('[Translation] Notification failed:', e);
+    }
+  }
+
   // --- Reload Translation Functionality ---
   function reloadTranslation() {
     if (loadDictionary()) {
@@ -255,16 +323,21 @@
       if (typeof SceneManager !== 'undefined' && SceneManager._scene) {
         const scene = SceneManager._scene;
         if (typeof scene.requestUpdate === 'function') scene.requestUpdate();
-        if (scene.children) {
-          scene.children.forEach(child => {
-            if (child && typeof child.refresh === 'function') {
-              child.refresh();
-            }
-          });
+        // Windows live inside scene._windowLayer, not directly in scene.children.
+        const targets = [];
+        if (scene.children) targets.push(...scene.children);
+        if (scene._windowLayer && scene._windowLayer.children) {
+          targets.push(...scene._windowLayer.children);
         }
+        targets.forEach(child => {
+          if (child && typeof child.refresh === 'function') {
+            child.refresh();
+          }
+        });
       }
 
       console.log('[Translation] Reloaded successfully!');
+      notify('Translation reloaded');
     }
   }
 
@@ -273,6 +346,30 @@
     if (event.ctrlKey && (event.key === 'r' || event.key === 'R')) {
       event.preventDefault();
       reloadTranslation();
+    }
+  });
+
+  // --- Instant text toggle (Ctrl + A) ---
+  let instantText = false;
+
+  if (typeof Window_Message !== 'undefined') {
+    // clearFlags resets _showFast on every new page; re-apply it when toggled on.
+    const _Window_Message_clearFlags = Window_Message.prototype.clearFlags;
+    Window_Message.prototype.clearFlags = function() {
+      _Window_Message_clearFlags.call(this);
+      if (instantText) this._showFast = true;
+    };
+  }
+
+  document.addEventListener('keydown', (event) => {
+    if (event.ctrlKey && (event.key === 'a' || event.key === 'A')) {
+      event.preventDefault();
+      instantText = !instantText;
+      // Apply immediately to a message that is currently being shown.
+      const scene = typeof SceneManager !== 'undefined' ? SceneManager._scene : null;
+      const msgWin = scene && scene._messageWindow;
+      if (msgWin) msgWin._showFast = instantText;
+      notify('Instant text: ' + (instantText ? 'ON' : 'OFF'));
     }
   });
 
@@ -468,6 +565,25 @@
     }
 
     return gamePath;
+  }
+
+  // --- Undo translated file names at load time ---
+  // Safety net: if a translated string reaches an asset loader, use the original name.
+  if (typeof ImageManager !== 'undefined' && typeof ImageManager.loadBitmap === 'function') {
+    const _ImageManager_loadBitmap_rev = ImageManager.loadBitmap;
+    ImageManager.loadBitmap = function(folder, filename) {
+      const args = Array.prototype.slice.call(arguments);
+      if (typeof filename === 'string' && _reverse.has(filename)) args[1] = _reverse.get(filename);
+      return _ImageManager_loadBitmap_rev.apply(this, args);
+    };
+  }
+  if (typeof AudioManager !== 'undefined' && typeof AudioManager.createBuffer === 'function') {
+    const _AudioManager_createBuffer = AudioManager.createBuffer;
+    AudioManager.createBuffer = function(folder, name) {
+      const args = Array.prototype.slice.call(arguments);
+      if (typeof name === 'string' && _reverse.has(name)) args[1] = _reverse.get(name);
+      return _AudioManager_createBuffer.apply(this, args);
+    };
   }
 
   // --- Text scaling ---

@@ -293,9 +293,106 @@ def load_key_set(path):
     return set(load_dict(path).keys())
 
 
+def iter_js_strings(src):
+    """Yield raw string-literal bodies from JS source, skipping // and /* */ comments."""
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        nxt = src[i + 1] if i + 1 < n else ''
+        if c == '/' and nxt == '*':
+            j = src.find('*/', i + 2)
+            i = n if j == -1 else j + 2
+        elif c == '/' and nxt == '/':
+            j = src.find('\n', i)
+            i = n if j == -1 else j + 1
+        elif c in '\'"`':
+            j = i + 1
+            while j < n and src[j] != c:
+                if src[j] == '\\':
+                    j += 2
+                elif src[j] == '\n' and c != '`':
+                    break  # unterminated (e.g. regex literal); resync
+                else:
+                    j += 1
+            yield src[i + 1:j]
+            i = j + 1
+        else:
+            i += 1
+
+
+def add_plugin_text(collected, s):
+    # Plugin scans only keep Japanese, non-code text.
+    if JP_RE.search(s) and is_likely_translatable(s):
+        add_text(collected, s.strip())
+
+
+def extract_plugin_param(collected, val):
+    """Parameter values only (never keys/descriptions, which are editor-only).
+    Unwraps nested JSON strings; code snippets contribute only their literals."""
+    if isinstance(val, dict):
+        for v in val.values():
+            extract_plugin_param(collected, v)
+    elif isinstance(val, list):
+        for v in val:
+            extract_plugin_param(collected, v)
+    elif isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return
+        if s[0] in '[{':
+            try:
+                parsed = json.loads(s)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, (dict, list)):
+                extract_plugin_param(collected, parsed)
+                return
+        if is_js_code_snippet(s):
+            for m in STRING_RE.finditer(s):
+                raw = m.group(1) if m.group(1) is not None else m.group(2)
+                if raw:
+                    add_plugin_text(collected, unescape_js(raw))
+            return
+        add_plugin_text(collected, s)
+
+
+def load_plugins_js(path):
+    """Return the parsed $plugins list, or None."""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            raw = f.read()
+        m = re.search(r'\$plugins\s*=\s*\[', raw)
+        start = m.end() - 1 if m else raw.find('[')
+        end = raw.rfind(']')
+        if start < 0 or end < start:
+            return None
+        data = json.loads(raw[start:end + 1])
+        return data if isinstance(data, list) else None
+    except Exception as e:
+        print(f'  Could not parse plugins.js: {e}')
+        return None
+
+
 def scan_plugins_folder(collected, plugins_dir):
+    plugins_js = os.path.join(os.path.dirname(plugins_dir), 'plugins.js')
+    plugins = load_plugins_js(plugins_js) if os.path.isfile(plugins_js) else None
+
+    enabled = None
+    if plugins is not None:
+        enabled = set()
+        for p in plugins:
+            if not isinstance(p, dict) or p.get('status') not in (True, 'true'):
+                continue  # disabled plugins never show text
+            name = p.get('name')
+            if not isinstance(name, str) or name == 'Translation':
+                continue
+            enabled.add(name)
+            extract_plugin_param(collected, p.get('parameters') or {})
+
     for fname in sorted(os.listdir(plugins_dir)):
         if not fname.lower().endswith('.js'):
+            continue
+        if enabled is not None and fname[:-3] not in enabled:
             continue
         fpath = os.path.join(plugins_dir, fname)
         try:
@@ -304,11 +401,10 @@ def scan_plugins_folder(collected, plugins_dir):
         except Exception as e:
             print(f'  Skipped {fname}: {e}')
             continue
-        for m in STRING_RE.finditer(src):
-            raw = m.group(1) if m.group(1) is not None else m.group(2)
-            s = unescape_js(raw)
-            if is_likely_translatable(s):
-                add_text(collected, s)
+        for raw in iter_js_strings(src):
+            if not raw or is_js_code_snippet(raw):
+                continue
+            add_plugin_text(collected, unescape_js(raw))
 
 
 # --------------------------------------------------------------------
