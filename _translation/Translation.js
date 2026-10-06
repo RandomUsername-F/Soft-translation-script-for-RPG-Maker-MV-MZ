@@ -30,8 +30,10 @@
  * Word wrap (config.ini, off by default): reflows long lines in the
  * message box only, without breaking words apart.
  *
- * Shortcuts:
- * Press Ctrl+R in-game to reload translation files and re-apply text translations.
+ * Shortcuts (left Ctrl only; right Ctrl is left to the game/engine):
+ * Left Ctrl+R: reload translation files and re-apply text translations.
+ * Left Ctrl+D: toggle translation off/on.
+ * Left Ctrl+A: toggle instant text display.
  *
  * Processing order: translation, then scaling, then word wrap. Either
  * feature is skipped entirely at startup when left off — no hooks are
@@ -78,7 +80,8 @@
       scaling_mode: '0',
       scaling_percent: '100',
       word_wrap: '0',
-      use_common_terms: '0'
+      use_common_terms: '0',
+      extra_text_keys: ''
     };
     const configPath = path.join(TRANS_DIR, 'config.ini');
     if (!fs.existsSync(configPath)) return defaults;
@@ -182,61 +185,93 @@
   // names, scrolling text, comments, etc.) since both load through
   // DataManager.
   //
+  // Data translation is allowlist-based: only known player-facing text fields
+  // are translated (same fields the extractor scans). File names (images,
+  // audio, etc.) are never touched, so image/audio replacement stays fully
+  // independent of text translation.
+  //
   // _originals remembers the untranslated string for every value replaced,
   // so a reload re-translates from the original. Without it the data holds
   // already-translated text, which matches no dictionary key.
   const _originals = new WeakMap();
-  // translated string -> original, used to undo translation of file names
-  // that slip through (plugin commands, scripts, etc.) at asset-load time.
-  const _reverse = new Map();
 
-  // Strings ending in an asset extension (plain or MV/MZ-encrypted) are file names.
-  const FILE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|ogg|m4a|wav|mp3|mp4|webm|rpgmvp|rpgmvm|rpgmvo|png_|ogg_|m4a_)$/i;
-
-  // Fields holding file names (images/audio/animations). Never translated,
-  // otherwise the game looks for a file that doesn't exist.
-  const FILE_KEYS = new Set([
-    'characterName', 'faceName', 'battlerName',
-    'battleback1Name', 'battleback2Name', 'parallaxName',
-    'title1Name', 'title2Name', 'tilesetNames',
-    'animation1Name', 'animation2Name', 'effectName'
+  // Database / map / system text fields.
+  const TEXT_KEYS = new Set([
+    'name', 'nickname', 'profile', 'description',
+    'message1', 'message2', 'message3', 'message4',
+    'displayName', 'gameTitle', 'currencyUnit'
   ]);
-  // Event commands whose parameters are file names: code -> parameter indices.
-  // (Show Picture, Change Battle Back, Change Parallax, Change Actor Images, Play Movie)
-  const CMD_FILE_PARAMS = {
-    231: [1], 283: [0, 1], 284: [0], 322: [1, 3, 5], 261: [0]
-  };
+  // Extra fields from config.ini: extra_text_keys=key1,key2,key3
+  for (const k of String(config.extra_text_keys || '').split(',')) {
+    const key = k.trim();
+    if (key) TEXT_KEYS.add(key);
+  }
 
-  function walk(obj, seen, skip) {
+  // Translate obj[key] if it is a string, tracking the original.
+  function translateProp(obj, key) {
+    const val = obj[key];
+    if (typeof val !== 'string') return;
+    const k = String(key);
+    let recs = _originals.get(obj);
+    const rec = recs && recs.get(k);
+    const source = (rec && rec.trans === val) ? rec.orig : val;
+    const t = translate(source);
+    if (t !== val) obj[key] = t;
+    if (t !== source) {
+      if (!recs) { recs = new Map(); _originals.set(obj, recs); }
+      recs.set(k, { orig: source, trans: t });
+    } else if (rec) {
+      recs.delete(k);
+    }
+  }
+
+  // Translate every string under node (used for System.json "terms").
+  function translateAll(node, seen) {
+    if (node === null || typeof node !== 'object' || seen.has(node)) return;
+    seen.add(node);
+    for (const k of Object.keys(node)) {
+      if (typeof node[k] === 'string') translateProp(node, k);
+      else translateAll(node[k], seen);
+    }
+  }
+
+  function walk(obj, seen) {
     if (obj === null || typeof obj !== 'object') return;
     if (seen.has(obj)) return;
     seen.add(obj);
-    let recs = _originals.get(obj);
-    // Audio objects {name, volume, pitch, ...}: name is a file name.
-    const isAudio = typeof obj.name === 'string' && 'volume' in obj && 'pitch' in obj;
-    let paramSkip = null;
-    if (typeof obj.code === 'number' && Array.isArray(obj.parameters) && CMD_FILE_PARAMS[obj.code]) {
-      paramSkip = new Set(CMD_FILE_PARAMS[obj.code].map(String));
+
+    if (Array.isArray(obj)) {
+      for (const item of obj) walk(item, seen);
+      return;
     }
+
+    // Event command: only Show Text lines, Scrolling Text lines, Show Choices.
+    if (typeof obj.code === 'number' && Array.isArray(obj.parameters)) {
+      const p = obj.parameters;
+      if (obj.code === 401 || obj.code === 405) {
+        translateProp(p, 0);
+      } else if (obj.code === 102 && Array.isArray(p[0])) {
+        for (let i = 0; i < p[0].length; i++) translateProp(p[0], i);
+      }
+      return;
+    }
+
+    // 'name' is not player-facing on audio objects, events, troops, common
+    // events (editor labels / file names).
+    const skipName =
+      ('volume' in obj && 'pitch' in obj) ||
+      Array.isArray(obj.pages) ||
+      Array.isArray(obj.list);
+
     for (const key of Object.keys(obj)) {
-      if (FILE_KEYS.has(key)) continue;
-      if (isAudio && key === 'name') continue;
-      if (skip && skip.has(key)) continue;
       const val = obj[key];
-      if (typeof val === 'string') {
-        const rec = recs && recs.get(key);
-        const source = (rec && rec.trans === val) ? rec.orig : val;
-        const t = translate(source);
-        if (t !== val) obj[key] = t;
-        if (t !== source) {
-          if (!recs) { recs = new Map(); _originals.set(obj, recs); }
-          recs.set(key, { orig: source, trans: t });
-          _reverse.set(t, source);
-        } else if (rec) {
-          recs.delete(key);
-        }
+      if (TEXT_KEYS.has(key)) {
+        if (key === 'name' && skipName) continue;
+        translateProp(obj, key);
+      } else if (key === 'terms') {
+        translateAll(val, seen);
       } else if (val !== null && typeof val === 'object') {
-        walk(val, seen, key === 'parameters' ? paramSkip : null);
+        walk(val, seen);
       }
     }
   }
@@ -244,7 +279,7 @@
   // --- Enhanced Translation Helper (with line break normalization & partial match) ---
   function translate(str) {
     if (typeof str !== 'string' || str.length === 0) return str;
-    if (FILE_EXT_RE.test(str)) return str;
+    if (!translationEnabled) return str;
     if (dict[str] !== undefined) return dict[str];
     
     const normalized = str.replace(/\r\n/g, '\n');
@@ -302,54 +337,96 @@
     }
   }
 
-  // --- Reload Translation Functionality ---
+  // --- Reload / toggle Translation Functionality ---
+  let translationEnabled = true;
+
+  // Re-walk loaded data (restores originals when disabled, re-translates when
+  // enabled) and refresh the active scene's windows.
+  function applyToLiveData() {
+    if (typeof $dataSystem !== 'undefined' && $dataSystem) {
+      const globalObjects = [
+        $dataActors,$dataClasses, $dataSkills,$dataItems,
+        $dataWeapons,$dataArmors, $dataEnemies,$dataTroops,
+        $dataStates,$dataAnimations, $dataTilesets,$dataCommonEvents,
+        $dataSystem,$dataMap
+      ];
+      const seen = new WeakSet();
+      for (const obj of globalObjects) {
+        if (obj) walk(obj, seen);
+      }
+    }
+
+    if (typeof SceneManager !== 'undefined' && SceneManager._scene) {
+      const scene = SceneManager._scene;
+      if (typeof scene.requestUpdate === 'function') scene.requestUpdate();
+      // Windows live inside scene._windowLayer, not directly in scene.children.
+      const targets = [];
+      if (scene.children) targets.push(...scene.children);
+      if (scene._windowLayer && scene._windowLayer.children) {
+        targets.push(...scene._windowLayer.children);
+      }
+      targets.forEach(child => {
+        if (child && typeof child.refresh === 'function') {
+          child.refresh();
+        }
+      });
+    }
+  }
+
   function reloadTranslation() {
     if (loadDictionary()) {
-      // Re-walk database and current map data
-      if (typeof $dataSystem !== 'undefined' &&$dataSystem) {
-        const globalObjects = [
-          $dataActors,$dataClasses, $dataSkills,$dataItems,
-          $dataWeapons,$dataArmors, $dataEnemies,$dataTroops,
-          $dataStates,$dataAnimations, $dataTilesets,$dataCommonEvents,
-          $dataSystem,$dataMap
-        ];
-        const seen = new WeakSet();
-        for (const obj of globalObjects) {
-          if (obj) walk(obj, seen);
-        }
-      }
-
-      // Refresh current scene windows/renderers if active
-      if (typeof SceneManager !== 'undefined' && SceneManager._scene) {
-        const scene = SceneManager._scene;
-        if (typeof scene.requestUpdate === 'function') scene.requestUpdate();
-        // Windows live inside scene._windowLayer, not directly in scene.children.
-        const targets = [];
-        if (scene.children) targets.push(...scene.children);
-        if (scene._windowLayer && scene._windowLayer.children) {
-          targets.push(...scene._windowLayer.children);
-        }
-        targets.forEach(child => {
-          if (child && typeof child.refresh === 'function') {
-            child.refresh();
-          }
-        });
-      }
-
+      translationEnabled = true;
+      applyToLiveData();
       console.log('[Translation] Reloaded successfully!');
       notify('Translation reloaded');
     }
   }
 
-  // Keybind listener: Ctrl + R
+  // Ctrl + D: unload (show originals) / load (reload files and translate).
+  function toggleTranslation() {
+    if (translationEnabled) {
+      translationEnabled = false;
+      applyToLiveData();
+      notify('Translation: OFF');
+    } else {
+      loadDictionary(); // keeps the previous dictionary if the file fails to parse
+      translationEnabled = true;
+      applyToLiveData();
+      notify('Translation: ON');
+    }
+  }
+
+  // Shortcuts use LEFT Ctrl only, so right Ctrl keeps whatever the game
+  // (or engine) does with it. Key events don't say which Ctrl is held, so
+  // track the left one ourselves.
+  let leftCtrlDown = false;
   document.addEventListener('keydown', (event) => {
-    if (event.ctrlKey && (event.key === 'r' || event.key === 'R')) {
+    if (event.code === 'ControlLeft') leftCtrlDown = true;
+  }, true);
+  document.addEventListener('keyup', (event) => {
+    if (event.code === 'ControlLeft') leftCtrlDown = false;
+  }, true);
+  window.addEventListener('blur', () => { leftCtrlDown = false; });
+  function isLeftCtrlCombo(event, letter) {
+    return leftCtrlDown && event.ctrlKey && event.key.toLowerCase() === letter;
+  }
+
+  document.addEventListener('keydown', (event) => {
+    if (isLeftCtrlCombo(event, 'd')) {
+      event.preventDefault();
+      toggleTranslation();
+    }
+  });
+
+  // Keybind listener: Left Ctrl + R
+  document.addEventListener('keydown', (event) => {
+    if (isLeftCtrlCombo(event, 'r')) {
       event.preventDefault();
       reloadTranslation();
     }
   });
 
-  // --- Instant text toggle (Ctrl + A) ---
+  // --- Instant text toggle (Left Ctrl + A) ---
   let instantText = false;
 
   if (typeof Window_Message !== 'undefined') {
@@ -362,7 +439,7 @@
   }
 
   document.addEventListener('keydown', (event) => {
-    if (event.ctrlKey && (event.key === 'a' || event.key === 'A')) {
+    if (isLeftCtrlCombo(event, 'a')) {
       event.preventDefault();
       instantText = !instantText;
       // Apply immediately to a message that is currently being shown.
@@ -537,6 +614,7 @@
   }
 
   function resolveTranslatedImage(gamePath) {
+    if (!translationEnabled) return gamePath;
     try {
       let decoded = decodeURIComponent(String(gamePath));
 
@@ -565,25 +643,6 @@
     }
 
     return gamePath;
-  }
-
-  // --- Undo translated file names at load time ---
-  // Safety net: if a translated string reaches an asset loader, use the original name.
-  if (typeof ImageManager !== 'undefined' && typeof ImageManager.loadBitmap === 'function') {
-    const _ImageManager_loadBitmap_rev = ImageManager.loadBitmap;
-    ImageManager.loadBitmap = function(folder, filename) {
-      const args = Array.prototype.slice.call(arguments);
-      if (typeof filename === 'string' && _reverse.has(filename)) args[1] = _reverse.get(filename);
-      return _ImageManager_loadBitmap_rev.apply(this, args);
-    };
-  }
-  if (typeof AudioManager !== 'undefined' && typeof AudioManager.createBuffer === 'function') {
-    const _AudioManager_createBuffer = AudioManager.createBuffer;
-    AudioManager.createBuffer = function(folder, name) {
-      const args = Array.prototype.slice.call(arguments);
-      if (typeof name === 'string' && _reverse.has(name)) args[1] = _reverse.get(name);
-      return _AudioManager_createBuffer.apply(this, args);
-    };
   }
 
   // --- Text scaling ---

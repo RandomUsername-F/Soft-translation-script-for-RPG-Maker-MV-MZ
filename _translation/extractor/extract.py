@@ -59,9 +59,41 @@ SKIP_KEYS = {
     'bgm', 'bgs', 'me', 'se', 'audio',
     'faceName', 'characterName', 'battlerName', 'panoramicName',
     'title1Name', 'title2Name', 'graphic', 'image', 'iconIndex', 'color',
+    'battleback1Name', 'battleback2Name', 'parallaxName', 'tilesetNames',
+    'animation1Name', 'animation2Name', 'effectName',
     'id', 'code', 'switchId', 'variableId', 'animationId',
     'position', 'positionType', 'background', 'speed', 'type', 'blendMode'
 }
+
+# Event commands whose parameters are only file names (Show Picture, Change
+# Battle Back, Change Parallax, Change Actor Images, Play Movie).
+FILE_PARAM_CODES = {231, 283, 284, 322, 261}
+
+ASSET_EXTS = (r'png|jpe?g|gif|webp|bmp|ogg|m4a|wav|mp3|mp4|webm|'
+              r'rpgmvp|rpgmvm|rpgmvo|png_|ogg_|m4a_')
+
+# Names (without extension) of every file under img/, audio/, movies/, fonts/.
+# Filled at scan time. FILTER_ASSETS is on only while reading event commands
+# and plugin text, so database fields (e.g. an item named like a picture)
+# are never dropped.
+ASSET_NAMES = set()
+FILTER_ASSETS = False
+
+
+def collect_asset_names(base):
+    names = set()
+    for sub in ('img', 'audio', 'movies', 'fonts'):
+        for _root, _dirs, files in os.walk(os.path.join(base, sub)):
+            for f in files:
+                names.add(os.path.splitext(f)[0])
+    return names
+
+
+def is_asset_name(s):
+    if not ASSET_NAMES:
+        return False
+    t = s.strip().replace('\\', '/')
+    return t in ASSET_NAMES or os.path.splitext(t.split('/')[-1])[0] in ASSET_NAMES
 
 
 def add_text(collected, s):
@@ -94,7 +126,7 @@ def is_likely_translatable(s):
         return False
 
     # Asset filenames or code files ending with common extensions
-    if re.search(r'\.(png|jpe?g|gif|webp|json|js|ogg|m4a|wav|mp3|ttf|otf|css|html)$', t, re.IGNORECASE):
+    if re.search(r'\.(' + ASSET_EXTS + r'|json|js|ttf|otf|css|html)$', t, re.IGNORECASE):
         return False
 
     # Pure system file paths (e.g. /usr/bin or ./path)
@@ -149,7 +181,7 @@ def extract_string_content(collected, s):
             return
 
     # Case 3: Raw display text string
-    if is_likely_translatable(val_str):
+    if is_likely_translatable(val_str) and not (FILTER_ASSETS and is_asset_name(val_str)):
         add_text(collected, val_str)
 
 
@@ -158,6 +190,16 @@ def extract_string_content(collected, s):
 # --------------------------------------------------------------------
 
 def extract_event_list(collected, event_list):
+    global FILTER_ASSETS
+    prev = FILTER_ASSETS
+    FILTER_ASSETS = True
+    try:
+        _extract_event_list(collected, event_list)
+    finally:
+        FILTER_ASSETS = prev
+
+
+def _extract_event_list(collected, event_list):
     if not isinstance(event_list, list):
         return
     for cmd in event_list:
@@ -170,6 +212,8 @@ def extract_event_list(collected, event_list):
         if code in (401, 405):  # Show Text, Scroll Text
             if params and isinstance(params[0], str):
                 add_text(collected, params[0])
+        elif code in FILE_PARAM_CODES:
+            pass  # parameters are file names, not text
         elif code == 101:  # Show Text Header (MZ speaker name in params[4])
             if len(params) >= 5 and isinstance(params[4], str):
                 extract_string_content(collected, params[4])
@@ -204,6 +248,9 @@ def extract_event_list(collected, event_list):
 
 def extract_json_recursive(collected, data):
     if isinstance(data, dict):
+        # Audio objects {name, volume, pitch, ...}: name is a file name.
+        is_audio = isinstance(data.get('name'), str) and 'volume' in data and 'pitch' in data
+
         # If object contains an event command list, parse it through event extractor
         if 'list' in data and isinstance(data['list'], list):
             extract_event_list(collected, data['list'])
@@ -212,6 +259,8 @@ def extract_json_recursive(collected, data):
             if key == 'list':
                 continue
             if key in SKIP_KEYS:
+                continue
+            if is_audio and key == 'name':
                 continue
             extract_json_recursive(collected, val)
 
@@ -322,7 +371,7 @@ def iter_js_strings(src):
 
 def add_plugin_text(collected, s):
     # Plugin scans only keep Japanese, non-code text.
-    if JP_RE.search(s) and is_likely_translatable(s):
+    if JP_RE.search(s) and is_likely_translatable(s) and not is_asset_name(s):
         add_text(collected, s.strip())
 
 
@@ -464,6 +513,9 @@ def extract_menu(data_dir, plugins_dir, out_path):
             return
 
     collected = {}
+
+    global ASSET_NAMES
+    ASSET_NAMES = collect_asset_names(os.path.dirname(data_dir))
 
     print('Scanning data folder...')
     scan_data_folder(collected, data_dir)
